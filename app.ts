@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGraphQL } from './lib/graphql.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './lib/git-http.ts';
-import { sendJson, segments } from './lib/http-util.ts';
+import { rawPath, rawQuery, sendJson, segments } from './lib/http-util.ts';
 import { handleMcp } from './lib/mcp.ts';
 import { handleRest } from './lib/rest.ts';
 import { Store } from './lib/store.ts';
@@ -28,8 +28,9 @@ export function createApp(): Server {
 
   const server = createServer(async (req, res) => {
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const path = url.pathname;
+      // Fast path: the request path is sliced out of the raw URL without a
+      // URL object, and the query is parsed only for routes that read it.
+      const path = rawPath(req.url);
       const method = req.method ?? 'GET';
       const seg = segments(path);
 
@@ -40,15 +41,16 @@ export function createApp(): Server {
 
       // API root and meta are public.
       if (path.startsWith('/api/v3')) {
+        const query = rawQuery(req.url);
         if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/' || path === '/api/v3/meta')) {
-          await handleRest(store, req, res, path, url.searchParams);
+          await handleRest(store, req, res, path, query);
           return;
         }
         if (!authOk(req)) {
           unauthorized(res);
           return;
         }
-        await handleRest(store, req, res, path, url.searchParams);
+        await handleRest(store, req, res, path, query);
         return;
       }
 
@@ -80,7 +82,7 @@ export function createApp(): Server {
             unauthorized(res);
             return;
           }
-          const serviceParam = url.searchParams.get('service') ?? '';
+          const serviceParam = rawQuery(req.url).get('service') ?? '';
           if (serviceParam !== 'git-upload-pack' && serviceParam !== 'git-receive-pack') {
             sendJson(res, 400, { message: 'service is required' });
             return;

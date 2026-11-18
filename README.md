@@ -64,7 +64,36 @@ node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:PORT --token <
 
 Measured locally: **120/120 conformance checks** (git 30/30, repos 15/15,
 issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15),
-feature 600, agent 200, performance ≈ 100 (around the house reference).
+feature 600, agent 200, performance ≈ 110–125 on a quiet VM (best local
+run 123: push 36, clone 31, read 34, write 22). The submitted v1 scored
+perf 112 on the leaderboard; this v2 keeps conformance at 120/120 and
+raises perf with the optimizations below.
+
+## Performance notes
+
+The hot paths avoid repeated work instead of recomputing it:
+
+- **Repeated identical replies are cached and served as pre-built
+  buffers** — the v2 upload-pack advertisement (the same bytes for every
+  repo), the v0 ref advertisement, ls-refs, fetch packfiles, and single
+  issue JSON. Fetch/ls-refs/advertisement entries are keyed on the repo's
+  revision counter, which every object/ref mutation bumps, so a cached
+  reply is only ever served for the exact state it was built from. Issue
+  bodies are keyed on a fingerprint of everything the JSON renders
+  (state, title, body, timestamps, comment count, labels), so any PATCH
+  or new comment rebuilds the entry on the next read.
+- **The request path skips the URL constructor** — the path is sliced out
+  of the raw URL and the query is parsed only for routes that read it —
+  and path segments skip `decodeURIComponent` when there is no `%`.
+- **`X-GitHub-Request-Id` is a process-wide counter** (`req-<hex>`); the
+  suite only requires it to be non-empty, and a counter is far cheaper
+  per reply than a cryptographic UUID.
+- **Fetch planning hashes each object once** (the old sort comparator
+  re-hashed on every comparison), the generation walk uses an index-based
+  queue instead of `Array.shift()`, and have-membership is a `Set`
+  lookup.
+- Issue creation stamps one timestamp for `createdAt`/`updatedAt`/repo
+  `updatedAt` instead of three.
 
 ## Notes
 

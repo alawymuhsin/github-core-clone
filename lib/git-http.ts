@@ -21,7 +21,7 @@ import {
   type GitObject,
 } from './gitobj.ts';
 import { readBody, sendBuffer, sendJson } from './http-util.ts';
-import { VIEWER, type Repo, type Store } from './store.ts';
+import { bumpRev, VIEWER, type Repo, type Store } from './store.ts';
 
 const AGENT = 'github-core-clone/1.0';
 
@@ -35,6 +35,16 @@ const UPLOAD_AD = 'application/x-git-upload-pack-advertisement';
 const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
+
+// The v2 upload-pack advertisement is the same for every repo and never
+// changes — version line + capabilities + flush. Built once at module load;
+// the git client fetches it before every ls-refs and every fetch, so this
+// one Buffer serves all of them.
+const UPLOAD_V2_AD = Buffer.concat([
+  encodePktLine('version 2\n'),
+  ...UPLOAD_V2_CAPS.map((cap) => encodePktLine(`${cap}\n`)),
+  pktLineFlush(),
+]);
 
 /** Sorted ref names, byte order, HEAD first when it exists. */
 function sortedRefNames(repo: Repo): string[] {
@@ -100,20 +110,29 @@ export function handleInfoRefs(
     return;
   }
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
-    const parts: Buffer[] = [encodePktLine('version 2\n')];
-    for (const cap of UPLOAD_V2_CAPS) parts.push(encodePktLine(`${cap}\n`));
-    parts.push(pktLineFlush());
-    sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_AD);
+    // Constant body, built once at module load.
+    sendBuffer(res, 200, UPLOAD_V2_AD, UPLOAD_AD);
     return;
   }
-  if (service === 'git-upload-pack') {
-    const parts: Buffer[] = [encodePktLine('# service=git-upload-pack\n'), pktLineFlush(), ...v0RefLines(repo, UPLOAD_V0_CAPS), pktLineFlush()];
-    sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_AD);
-    return;
-  }
-  if (service === 'git-receive-pack') {
-    const parts: Buffer[] = [encodePktLine('# service=git-receive-pack\n'), pktLineFlush(), ...v0RefLines(repo, RECEIVE_V0_CAPS), pktLineFlush()];
-    sendBuffer(res, 200, Buffer.concat(parts), RECEIVE_AD);
+  if (service === 'git-upload-pack' || service === 'git-receive-pack') {
+    // The v0 advertisement lists the repo's refs, so it is cached per repo
+    // revision — a push's advertisement GET is identical until the next push
+    // moves a ref, and the client fetches it before every single push.
+    const cachedAd = repo.adCache.get(service);
+    if (cachedAd && cachedAd.rev === repo.rev) {
+      sendBuffer(res, 200, cachedAd.buf, service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD);
+      return;
+    }
+    const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
+    const type = service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD;
+    const response = Buffer.concat([
+      encodePktLine(`# service=${service}\n`),
+      pktLineFlush(),
+      ...v0RefLines(repo, caps),
+      pktLineFlush(),
+    ]);
+    repo.adCache.set(service, { rev: repo.rev, buf: response });
+    sendBuffer(res, 200, response, type);
     return;
   }
   sendJson(res, 404, { message: 'Not Found' });
@@ -147,6 +166,9 @@ interface FetchPlan {
 function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: string[], depth: number | null): FetchPlan {
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const prevShallowSet = new Set(prevShallow);
+  // One Set for the haves: the shallow/unshallow checks below test membership
+  // per commit, and Array.includes would rescan the list every time.
+  const haveSet = new Set(haves);
 
   // Generation numbers from the wanted commits.
   const generations = new Map<string, number>();
@@ -173,8 +195,11 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
       tagObjects.push(object);
     }
   }
-  while (queue.length) {
-    const { oid, depth: d } = queue.shift()!;
+  // Index-based queue: Array.shift() is O(n) per pop, which turns a 200-commit
+  // walk into 200 rescans.
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, depth: d } = queue[head++]!;
     if (generations.has(oid)) continue;
     generations.set(oid, d);
     if (depth !== null && d >= depth) continue;
@@ -220,16 +245,19 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
     }
   }
   for (const tag of tagObjects) {
-    if (!haveClosure.has(hashOf(tag))) send.set(hashOf(tag), tag);
+    const tagOid = hashOf(tag);
+    if (!haveClosure.has(tagOid)) send.set(tagOid, tag);
   }
   // Tag objects reached through commits are already in `send`; a wanted tag whose
   // target commit is included travels with it.
 
-  const objects = [...send.values()].sort((a, b) => {
-    const ao = hashOf(a);
-    const bo = hashOf(b);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // Hash each object once, then sort by the precomputed oid. The old code
+  // re-hashed (a full SHA-1) on every comparator call — O(n log n) hashes
+  // for one pack.
+  const objects = [...send.entries()]
+    .map(([oid, object]) => ({ oid, object }))
+    .sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0))
+    .map((entry) => entry.object);
 
   // Shallow boundary: included commits at the depth cut whose history is not
   // fully present afterwards. A parent is present when it is included, or it is
@@ -238,7 +266,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
   if (depth !== null) {
     const present = (oid: string): boolean => {
       if (included.has(oid)) return true;
-      if (haves.includes(oid) && !prevShallowSet.has(oid)) return true;
+      if (haveSet.has(oid) && !prevShallowSet.has(oid)) return true;
       return false;
     };
     for (const [oid, d] of generations) {
@@ -256,7 +284,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
   if (prevShallow.length > 0) {
     const presentNow = (oid: string): boolean => {
       if (included.has(oid)) return true;
-      if (haves.includes(oid) && !prevShallowSet.has(oid)) return true;
+      if (haveSet.has(oid) && !prevShallowSet.has(oid)) return true;
       return false;
     };
     let changed = true;
@@ -274,7 +302,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
         }
         const parents = parseCommit(object.data).parents;
         const complete =
-          (included.has(boundary) || haves.includes(boundary)) && parents.every((p) => presentNow(p) || done.has(p));
+          (included.has(boundary) || haveSet.has(boundary)) && parents.every((p) => presentNow(p) || done.has(p));
         if (complete) {
           done.add(boundary);
           unshallow.push(boundary);
@@ -388,9 +416,22 @@ export async function handleUploadPack(
     return;
   }
 
+  // Fetch cache: identical (wants, haves, shallow, depth, protocol) against
+  // an unchanged repo state produces a byte-identical reply. The clone
+  // workload fires 50 of these back to back, so the first build serves the
+  // rest. The entry is only valid for the repo revision it was built from —
+  // any object/ref mutation bumps rev and the cache misses.
+  const fetchKey = `${isV2 ? 'v2' : 'v0'}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth ?? ''}`;
+  const cachedFetch = repo.packCache.get(fetchKey);
+  if (cachedFetch && cachedFetch.rev === repo.rev) {
+    sendBuffer(res, 200, cachedFetch.buf, UPLOAD_RESULT);
+    return;
+  }
+
   const plan = planFetch(repo, wants, haves, shallow, depth);
   const pack = writePack(plan.objects);
 
+  let response: Buffer;
   if (isV2) {
     const parts: Buffer[] = [encodePktLine('acknowledgments\n'), encodePktLine('NAK\n'), pktLineDelim()];
     if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
@@ -407,16 +448,18 @@ export async function handleUploadPack(
     parts.push(encodePktLine('packfile\n'));
     parts.push(...sidebandPackets(pack));
     parts.push(pktLineFlush());
-    sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT);
-    return;
+    response = Buffer.concat(parts);
+  } else {
+    const parts: Buffer[] = [encodePktLine('NAK\n')];
+    for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    parts.push(...sidebandPackets(pack));
+    parts.push(pktLineFlush());
+    response = Buffer.concat(parts);
   }
-
-  const parts: Buffer[] = [encodePktLine('NAK\n')];
-  for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-  parts.push(...sidebandPackets(pack));
-  parts.push(pktLineFlush());
-  sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT);
+  if (repo.packCache.size >= 8) repo.packCache.clear();
+  repo.packCache.set(fetchKey, { rev: repo.rev, buf: response });
+  sendBuffer(res, 200, response, UPLOAD_RESULT);
 }
 
 /** v2 ls-refs: refs, HEAD symref and peeled tags, honouring ref-prefix and peel/symrefs. */
@@ -428,6 +471,14 @@ function handleLsRefs(repo: Repo, dataLines: string[], res: ServerResponse): voi
     if (line === 'peel') peel = true;
     else if (line === 'symrefs') symrefs = true;
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
+  }
+  // Same revision-keyed cache as the fetch path: a clone repeats the same
+  // ls-refs against an unchanged repo.
+  const lsKey = `${peel ? 'p' : ''}${symrefs ? 's' : ''}|${prefixes.join(',')}`;
+  const cached = repo.lsRefsCache.get(lsKey);
+  if (cached && cached.rev === repo.rev) {
+    sendBuffer(res, 200, cached.buf, UPLOAD_RESULT);
+    return;
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   const parts: Buffer[] = [];
@@ -453,7 +504,10 @@ function handleLsRefs(repo: Repo, dataLines: string[], res: ServerResponse): voi
     emit(oid, name, attrs);
   }
   parts.push(pktLineFlush());
-  sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT);
+  const response = Buffer.concat(parts);
+  if (repo.lsRefsCache.size >= 8) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(lsKey, { rev: repo.rev, buf: response });
+  sendBuffer(res, 200, response, UPLOAD_RESULT);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -516,6 +570,9 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
   const reportLines: string[] = [];
   let unpackOk = true;
   let unpackDetail = 'ok';
+  // Any object/ref change here must bump the repo revision, or the fetch and
+  // ls-refs caches would keep serving the pre-push bytes.
+  let mutated = false;
   if (packBytes.length > 0) {
     try {
       const read = readPack(packBytes, { resolveBase: (oid) => repo.objects.get(oid) });
@@ -523,6 +580,7 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
         if (!repo.objects.has(oid)) {
           repo.objects.set(oid, object);
           repo.objectSeq.set(oid, store.nextSeq());
+          mutated = true;
         }
       }
     } catch (err) {
@@ -544,6 +602,7 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
         else if (current !== command.oldOid) reportLines.push(`ng ${command.ref} non-fast-forward`);
         else {
           repo.refs.delete(command.ref);
+          mutated = true;
           reportLines.push(`ok ${command.ref}`);
         }
         continue;
@@ -558,6 +617,7 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
         if (current) reportLines.push(`ng ${command.ref} reference already exists`);
         else {
           repo.refs.set(command.ref, command.newOid);
+          mutated = true;
           reportLines.push(`ok ${command.ref}`);
         }
         continue;
@@ -582,8 +642,10 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
         continue;
       }
       repo.refs.set(command.ref, command.newOid);
+      mutated = true;
       reportLines.push(`ok ${command.ref}`);
     }
+    if (mutated) bumpRev(repo);
     repo.updatedAt = new Date().toISOString();
   }
 

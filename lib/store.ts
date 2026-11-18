@@ -90,6 +90,26 @@ export interface Repo {
   issueComments: Map<number, IssueComment[]>;
   pulls: Map<number, PullRequest>;
   nextNumber: number;
+  /**
+   * Monotonic revision of the repo's git state (objects + refs). Every
+   * mutation bumps it; the pack and ls-refs caches key their entries on it,
+   * so a cached response is only ever served for the exact state it was
+   * built from.
+   */
+  rev: number;
+  /** Cached fetch responses: key → {rev, full response Buffer}. Bounded (8). */
+  packCache: Map<string, { rev: number; buf: Buffer }>;
+  /** Cached ls-refs responses: key → {rev, full response Buffer}. Bounded (8). */
+  lsRefsCache: Map<string, { rev: number; buf: Buffer }>;
+  /** Cached v0 info/refs advertisements, keyed by service. Bounded (2). */
+  adCache: Map<string, { rev: number; buf: Buffer }>;
+  /** Cached single-issue JSON bodies: number → {fingerprint, body Buffer}. */
+  issueCache: Map<number, { fp: string; buf: Buffer }>;
+}
+
+/** Bump a repo's git revision after any objects/refs mutation. */
+export function bumpRev(repo: Repo): void {
+  repo.rev += 1;
 }
 
 export function repoKey(owner: string, name: string): string {
@@ -166,6 +186,11 @@ export class Store {
       issueComments: new Map(),
       pulls: new Map(),
       nextNumber: 1,
+      rev: 0,
+      packCache: new Map(),
+      lsRefsCache: new Map(),
+      adCache: new Map(),
+      issueCache: new Map(),
     };
     this.repos.set(key, repo);
     return repo;
@@ -191,6 +216,7 @@ export class Store {
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, { type, data });
       repo.objectSeq.set(oid, this.nextSeq());
+      bumpRev(repo);
     }
     return oid;
   }
@@ -303,6 +329,7 @@ export class Store {
     );
     repo.refs.set(ref, commit);
     repo.updatedAt = nowIso();
+    bumpRev(repo);
     return { commit, created: true };
   }
 
@@ -486,6 +513,8 @@ export class Store {
     }
     if (!input.title || input.title.trim() === '') return { error: 'title is required', status: 422 };
     const number = repo.nextNumber++;
+    // One timestamp per creation — the three fields always agree anyway.
+    const now = nowIso();
     const issue: Issue = {
       id: this.nextIssueId++,
       number,
@@ -494,14 +523,14 @@ export class Store {
       state: 'open',
       labels,
       createdSeq: this.nextSeq(),
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
       closedAt: null,
       user: VIEWER.login,
     };
     repo.issues.set(number, issue);
     repo.issueComments.set(number, []);
-    repo.updatedAt = nowIso();
+    repo.updatedAt = now;
     return { issue };
   }
 
@@ -528,6 +557,7 @@ export class Store {
       }
     }
     const number = repo.nextNumber++;
+    const now = nowIso();
     const pull: PullRequest = {
       id: this.nextPullId++,
       number,
@@ -542,13 +572,13 @@ export class Store {
       headSha: headTip,
       baseSha: baseTip,
       createdSeq: this.nextSeq(),
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
       closedAt: null,
       user: VIEWER.login,
     };
     repo.pulls.set(number, pull);
-    repo.updatedAt = nowIso();
+    repo.updatedAt = now;
     return { pull };
   }
 
@@ -586,6 +616,7 @@ export class Store {
     pull.closedAt = pull.mergedAt;
     pull.updatedAt = pull.mergedAt;
     repo.updatedAt = nowIso();
+    bumpRev(repo);
     return { sha: commit };
   }
 

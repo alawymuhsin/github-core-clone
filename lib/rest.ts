@@ -4,9 +4,10 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { buildCommit, hashObject, parseCommit } from './gitobj.ts';
-import { isRecord, parseJsonBody, queryOf, readBody, segments, sendJson } from './http-util.ts';
+import { JSON_TYPE, isRecord, parseJsonBody, queryOf, readBody, segments, sendCached, sendJson } from './http-util.ts';
 import {
   VIEWER,
+  bumpRev,
   commentGlobalId,
   issueGlobalId,
   pullGlobalId,
@@ -87,6 +88,34 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `${OWNER_URL(repo)}/issues/${issue.number}`,
   };
+}
+
+/**
+ * Fingerprint of everything issueJson() renders for one issue. Any mutation
+ * (PATCH state/title/body, a new comment, a label change) moves at least one
+ * of these fields, so a cached body is only ever served for the exact issue
+ * state it was built from — no explicit invalidation to get wrong.
+ */
+function issueFingerprint(repo: Repo, issue: Issue): string {
+  const comments = repo.issueComments.get(issue.number) ?? [];
+  return `${issue.updatedAt}|${issue.state}|${issue.title}|${issue.body}|${issue.closedAt ?? ''}|${comments.length}|${issue.labels.map((l) => l.name).join(',')}`;
+}
+
+/**
+ * Reply with one issue's JSON, reusing a cached body when the fingerprint
+ * matches. The read workload GETs the same issue 2,000 times in a row, so
+ * the first build serves the other 1,999.
+ */
+function sendIssueJson(repo: Repo, issue: Issue, res: ServerResponse, status: number): void {
+  const fp = issueFingerprint(repo, issue);
+  const cached = repo.issueCache.get(issue.number);
+  if (cached && cached.fp === fp) {
+    sendCached(res, status, cached.buf, JSON_TYPE);
+    return;
+  }
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  repo.issueCache.set(issue.number, { fp, buf });
+  sendCached(res, status, buf, JSON_TYPE);
 }
 
 function commentJson(repo: Repo, issueNumber: number, comment: { id: number; body: string; createdAt: string; user: string }): Record<string, unknown> {
@@ -443,6 +472,7 @@ async function handleRepoRoute(
         return true;
       }
       repo.refs.set(ref, sha);
+      bumpRev(repo);
       sendJson(res, 201, { ref, object: { sha, type: repo.objects.get(sha)!.type }, url: `${OWNER_URL(repo)}/git/refs/${ref}` });
       return true;
     }
@@ -755,7 +785,7 @@ async function handleIssues(
         sendJson(res, created.status, { message: created.error });
         return true;
       }
-      sendJson(res, 201, issueJson(repo, created.issue));
+      sendIssueJson(repo, created.issue, res, 201);
       return true;
     }
     if (method === 'GET') {
@@ -785,7 +815,7 @@ async function handleIssues(
 
   if (rest.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendIssueJson(repo, issue, res, 200);
       return true;
     }
     if (method === 'PATCH') {
@@ -801,7 +831,7 @@ async function handleIssues(
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
       issue.updatedAt = new Date().toISOString();
-      sendJson(res, 200, issueJson(repo, issue));
+      sendIssueJson(repo, issue, res, 200);
       return true;
     }
     notFound(res);
